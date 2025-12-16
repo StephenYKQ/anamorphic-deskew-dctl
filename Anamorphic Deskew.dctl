@@ -1,0 +1,194 @@
+// Anamorphic Deskew.dctl
+//
+// Author: Stephen Yang Kaiqi 杨锴埼
+// Website: https://stecage.com
+// GitHub: https://github.com/StephenYKQ
+//
+// Parameters:
+//   1. squeeze_ratio - Anamorphic lens squeeze ratio
+//   2. theta - Active axis angle relative to horizontal axis
+//   3. custom_scale - Manual scaling factor (0.75-2.0)
+//   4. auto_scale - Automatically crops the image to the valid active image area (may crop more)
+//   5. edge_mode - Edge handling mode: 0=stretch edge pixels, 1=black, 2=pink
+//   6. show_guides - Show center guides (cross and circle)
+//   7. guide_size - Size of the circle guide
+//   8. guide_thickness - Thickness of the guides
+//   9. guide_color - Color of the guides (0=red, 1=black, 2=white)
+//   10. guide_opacity - Opacity of the guides
+//   11. guide_x - Horizontal position of the guides
+//   12. guide_y - Vertical position of the guides
+
+DEFINE_UI_PARAMS(squeeze_ratio, Squeeze Ratio, DCTLUI_SLIDER_FLOAT, 1.5, 1.0, 2.5, 0.01)
+DEFINE_UI_PARAMS(theta, Skew Angle, DCTLUI_SLIDER_FLOAT, 0.0, -45.0, 45.0, 0.1)
+DEFINE_UI_PARAMS(custom_scale, Scale, DCTLUI_SLIDER_FLOAT, 1.0, 0.75, 2.0, 0.01)
+DEFINE_UI_PARAMS(auto_scale, Auto Edge Crop, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(edge_mode, Edge Mode, DCTLUI_COMBO_BOX, 0, {PINK_BG, BLACK_BG, STRETCH}, {Pink, Black, Stretch Edge Pixels})
+DEFINE_UI_PARAMS(show_guides, Show Guides, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(guide_size, Guide Circle Size, DCTLUI_SLIDER_FLOAT, 0.2, 0.05, 0.5, 0.01)
+DEFINE_UI_PARAMS(guide_thickness, Guide Thickness, DCTLUI_SLIDER_FLOAT, 0.002, 0.001, 0.01, 0.001)
+DEFINE_UI_PARAMS(guide_color, Guide Color, DCTLUI_COMBO_BOX, 0, {RED, BLACK, WHITE}, {Red, Black, White})
+DEFINE_UI_PARAMS(guide_opacity, Guide Opacity, DCTLUI_SLIDER_FLOAT, 1.0, 0.1, 1.0, 0.1)
+DEFINE_UI_PARAMS(guide_x, Guide X Position, DCTLUI_SLIDER_FLOAT, 0.5, 0.45, 0.55, 0.001)
+DEFINE_UI_PARAMS(guide_y, Guide Y Position, DCTLUI_SLIDER_FLOAT, 0.5, 0.45, 0.55, 0.001)
+
+__DEVICE__ float2 getSourceCoord(float2 dstUV, float squeeze_ratio, float theta, float scale) {
+    float2 uv = make_float2(dstUV.x - 0.5f, dstUV.y - 0.5f);
+    uv = uv / scale;
+
+    float th = theta * M_PI / 180.0f;
+    float k = 1.0f / squeeze_ratio;
+    float num = k * sin(th);
+    float den = 1.0f - k * cos(th);
+    float tanAlpha = num / fmax(den, 1e-6f);
+
+    float2x2 H;
+    H[0][0] = 1.0f; H[0][1] = tanAlpha;
+    H[1][0] = 0.0f; H[1][1] = 1.0f;
+
+    float det = H[0][0] * H[1][1] - H[0][1] * H[1][0];
+    float2x2 Hinv;
+    Hinv[0][0] =  H[1][1] / det;
+    Hinv[0][1] = -H[0][1] / det;
+    Hinv[1][0] = -H[1][0] / det;
+    Hinv[1][1] =  H[0][0] / det;
+
+    float2 src;
+    src.x = Hinv[0][0] * uv.x + Hinv[0][1] * uv.y + 0.5f;
+    src.y = Hinv[1][0] * uv.x + Hinv[1][1] * uv.y + 0.5f;
+
+    return src;
+}
+
+__DEVICE__ float calculateAutoScale(float squeeze_ratio, float theta) {
+    float th = theta * M_PI / 180.0f;
+    float k = 1.0f / squeeze_ratio;
+    float tanAlpha = (k * sin(th)) / fmax(1.0f - k * cos(th), 1e-6f);
+
+    float H00 = 1.0f;
+    float H01 = tanAlpha;
+    float H10 = 0.0f;
+    float H11 = 1.0f;
+
+    float corners[4][2] = {
+        {-0.5f, -0.5f},
+        { 0.5f, -0.5f},
+        { 0.5f,  0.5f},
+        {-0.5f,  0.5f}
+    };
+
+    float minX = 1e10f;
+    float maxX = -1e10f;
+    float minY = 1e10f;
+    float maxY = -1e10f;
+    
+    for (int i = 0; i < 4; i++) {
+        float x = corners[i][0];
+        float y = corners[i][1];
+        
+        float tx = H00 * x + H01 * y;
+        float ty = H10 * x + H11 * y;
+        
+        minX = fmin(minX, tx);
+        maxX = fmax(maxX, tx);
+        minY = fmin(minY, ty);
+        maxY = fmax(maxY, ty);
+    }
+
+    float rangeX = maxX - minX;
+    float rangeY = maxY - minY;
+    
+    float scaleX = rangeX / 1.0f;
+    float scaleY = rangeY / 1.0f;
+    
+    float scale = fmax(scaleX, scaleY);
+    
+    return scale;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB) {
+    float2 uv = make_float2((float)p_X / p_Width, (float)p_Y / p_Height);
+    float scale = custom_scale;
+    if (auto_scale) {
+        scale = calculateAutoScale(squeeze_ratio, theta) * custom_scale;
+    }
+    
+    float2 srcUV = getSourceCoord(uv, squeeze_ratio, theta, scale);
+    
+    bool isOutOfBounds = (srcUV.x < 0.0f || srcUV.x > 1.0f || srcUV.y < 0.0f || srcUV.y > 1.0f);
+    
+    if (isOutOfBounds) {
+        if (edge_mode == PINK_BG) {
+            return make_float3(1.0f, 0.41f, 0.71f);
+        } else if (edge_mode == BLACK_BG) {
+            return make_float3(0.0f, 0.0f, 0.0f);
+        }
+        srcUV.x = clamp(srcUV.x, 0.0f, 1.0f);
+        srcUV.y = clamp(srcUV.y, 0.0f, 1.0f);
+    }
+    
+    float srcX = srcUV.x * p_Width;
+    float srcY = srcUV.y * p_Height;
+    
+    int x0 = (int)srcX;
+    int y0 = (int)srcY;
+    int x1 = min(x0 + 1, p_Width - 1);
+    int y1 = min(y0 + 1, p_Height - 1);
+    
+    float fx = srcX - x0;
+    float fy = srcY - y0;
+    
+    float r00 = _tex2D(p_TexR, x0, y0);
+    float g00 = _tex2D(p_TexG, x0, y0);
+    float b00 = _tex2D(p_TexB, x0, y0);
+    
+    float r01 = _tex2D(p_TexR, x0, y1);
+    float g01 = _tex2D(p_TexG, x0, y1);
+    float b01 = _tex2D(p_TexB, x0, y1);
+    
+    float r10 = _tex2D(p_TexR, x1, y0);
+    float g10 = _tex2D(p_TexG, x1, y0);
+    float b10 = _tex2D(p_TexB, x1, y0);
+    
+    float r11 = _tex2D(p_TexR, x1, y1);
+    float g11 = _tex2D(p_TexG, x1, y1);
+    float b11 = _tex2D(p_TexB, x1, y1);
+    
+    float r = _mix(_mix(r00, r10, fx), _mix(r01, r11, fx), fy);
+    float g = _mix(_mix(g00, g10, fx), _mix(g01, g11, fx), fy);
+    float b = _mix(_mix(b00, b10, fx), _mix(b01, b11, fx), fy);
+    
+    if (show_guides) {
+        float2 center = make_float2(guide_x, guide_y);
+        float2 pixelPos = make_float2((float)p_X / p_Width, (float)p_Y / p_Height);
+        
+        float3 guideColor;
+        if (guide_color == RED) {
+            guideColor = make_float3(1.0f, 0.0f, 0.0f);
+        } else if (guide_color == BLACK) {
+            guideColor = make_float3(0.0f, 0.0f, 0.0f);
+        } else {
+            guideColor = make_float3(1.0f, 1.0f, 1.0f);
+        }
+        
+        float aspectRatio = (float)p_Width / (float)p_Height;
+        
+        bool isOnCross = (fabs(pixelPos.x - center.x) < guide_thickness / (2 * aspectRatio)) ||
+                          (fabs(pixelPos.y - center.y) < guide_thickness / 2);
+        
+        float dx = (pixelPos.x - center.x) * aspectRatio;
+        float dy = pixelPos.y - center.y;
+        float correctedDist = sqrt(dx*dx + dy*dy);
+        bool isOnCircle = fabs(correctedDist - guide_size) < guide_thickness / 2.5;
+        
+        if (isOnCross || isOnCircle) {
+            float3 result = make_float3(
+                r * (1.0f - guide_opacity) + guideColor.x * guide_opacity,
+                g * (1.0f - guide_opacity) + guideColor.y * guide_opacity,
+                b * (1.0f - guide_opacity) + guideColor.z * guide_opacity
+            );
+            return result;
+        }
+    }
+    
+    return make_float3(r, g, b);
+}
